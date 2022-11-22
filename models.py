@@ -163,7 +163,7 @@ class Conv2dWithConstraint(nn.Conv2d):
 #             nn.BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
 #             nn.ELU(alpha=0.1),
 #             nn.AvgPool2d(kernel_size=(1,4), stride=(1,4),padding=0),
-#             nn.Dropout(p=0.5)
+#             nn.Dropout(p=0)
 #         )
 
 #     def forward(self, x):
@@ -186,13 +186,27 @@ class Conv2dWithConstraint(nn.Conv2d):
 #             nn.BatchNorm2d(32, eps=1e-05, momentum=0.1, affine=True, track_running_stats=True),
 #             nn.ELU(alpha=0.1),
 #             nn.AvgPool2d(kernel_size=(1,8), stride=(1,8),padding=0),
-#             nn.Dropout(p=0.5),
+#             nn.Dropout(p=0),
 #             nn.Flatten(),
 #         )
 
 #     def forward(self, x):
 #         x =  self.separableConv(x)
 #         return x
+
+# class cls(nn.Module):
+#     def __init__(self, num_S=192, hidden=32, dropout_rate=0, num_classes=3):
+#         super(cls, self).__init__()
+#         self.fc = nn.Sequential(
+#             nn.Linear(num_S, hidden),
+#             nn.ReLU(),
+#             nn.Dropout(dropout_rate),
+#             nn.Linear(hidden, num_classes)
+#         )
+    
+#     def forward(self, x):
+#         out = self.fc(x)
+#         return out
 
 # TSception
 class CFE(nn.Module):
@@ -255,7 +269,7 @@ class DSFE(nn.Module):
                       kernel_size=kernel, stride=step),
             nn.LeakyReLU(),
             nn.AvgPool2d(kernel_size=(1, pool), stride=(1, pool)))
-    
+
     def forward(self, x):
         out = self.fusion_layer(x)
         out = self.BN_fusion(out)
@@ -273,13 +287,13 @@ class cls(nn.Module):
         )
     
     def forward(self, x):
-        x = self.fc(x)
-        return x
+        out = self.fc(x)
+        return out
 
 # from torchsummary import summary
 # model = DSFE()
 # # print(model(torch.ones([1, 15, 3, 26])).shape)
-# summary(model.cuda(),(15,3,26))
+# summary(model.cuda(),(32,1,50))
 
 
 class MSMDAERNet(nn.Module):
@@ -288,10 +302,11 @@ class MSMDAERNet(nn.Module):
         self.sharedNet = pretrained_CFE(pretrained=pretrained)
         for i in range(number_of_source):
             exec('self.DSFE' + str(i) + '=DSFE()')
+            # exec('self.DSFE' + str(i) + '=TSception()')
             exec('self.cls_fc_DSC' + str(i) + '=cls()')
-            # exec('self.cls_fc_DSC' + str(i) + '=nn.Linear(32,' + str(number_of_category) + ')')
+            # exec('self.cls_fc_DSC' + str(i) + '=nn.Linear(32*6,' + str(number_of_category) + ')')
 
-    def forward(self, data_src, number_of_source, data_tgt=0, label_src=0, mark=0):
+    def forward(self, data_src=0, number_of_source=0, data_tgt=0, label_src=0):
         '''
         description: take one source data and the target data in every forward operation.
             the mmd loss is calculated between the source data and the target data (both after the DSFE)
@@ -306,55 +321,74 @@ class MSMDAERNet(nn.Module):
             data_tgt: target data
         return {type}
         '''
-        mmd_loss = 0
-        disc_loss = 0
-        data_tgt_class = []
         if self.training == True:
+            disc_loss = 0
+            mmd_loss = 0
+            cls_loss = 0
+            train_acc_num = 0
+            data_src_CFE = []
+            data_src_DSFE = []
+            data_tgt_DSFE = []
+            data_src_pred = []
+            data_tgt_pred = []
             # common feature extractor
-            data_src_CFE = self.sharedNet(data_src)
             data_tgt_CFE = self.sharedNet(data_tgt)
-            # Each domian specific feature extractor 
-            # to extract the domain specific feature of target data
-            DSFE_name = 'self.DSFE' + str(mark)
-            data_tgt_DSFE = eval(DSFE_name)(data_tgt_CFE)
-            # Use the specific feature extractor
-            # to extract the source data, and calculate the mmd loss
-            DSFE_name = 'self.DSFE' + str(mark)
-            data_src_DSFE = eval(DSFE_name)(data_src_CFE)
-            mmd_loss += utils.mmd(data_src_DSFE, data_tgt_DSFE)
-            
-            # try to narrow the distance between the classifiers
             for i in range(number_of_source):
-                class_name = 'self.cls_fc_DSC' + str(i)
-                data_tgt_class_i = eval(class_name)(data_tgt_DSFE)
-                data_tgt_class.append(data_tgt_class_i)
+                data_src_CFE_i = self.sharedNet(data_src[i])
+                data_src_CFE.append(data_src_CFE_i)
+            # Each domian specific feature extractor
+            # to extract the domain specific feature of target data and source data
+            for i in range(number_of_source):
+                DSFE_name = 'self.DSFE' + str(i)
+                data_tgt_DSFE_i = eval(DSFE_name)(data_tgt_CFE)
+                data_src_DSFE_i = eval(DSFE_name)(data_src_CFE[i])
+                data_tgt_DSFE.append(data_tgt_DSFE_i)
+                data_src_DSFE.append(data_src_DSFE_i)
+            
+            # calculate the mmd loss
+            for i in range(number_of_source):
+                mmd_loss += utils.mmd(data_src_DSFE[i], data_tgt_DSFE[i])
+            
+            # calculate source data and target data passing the classifier
+            for i in range(number_of_source):
+                cls_name = 'self.cls_fc_DSC' + str(i)
+                data_tgt_pred_i = eval(cls_name)(data_tgt_DSFE[i])
+                data_src_pred_i = eval(cls_name)(data_src_DSFE[i])
+                data_tgt_pred.append(data_tgt_pred_i)
+                data_src_pred.append(data_src_pred_i)
             # discrepency loss
-            for i in range(len(data_tgt_class)):
-                if i != mark:
-                    disc_loss += torch.mean(torch.abs(
-                        F.softmax(data_tgt_class[mark], dim=1) - F.softmax(data_tgt_class[i], dim=1)
+            for i in range(len(data_tgt_pred)):
+                for j in range(len(data_tgt_pred)):
+                    if i != j:
+                        disc_loss += torch.mean(torch.abs(
+                        F.softmax(data_tgt_pred[i], dim=1) - F.softmax(data_tgt_pred[j], dim=1)
                     ))
 
-            # domain specific classifier and cls_loss
-            DSC_name = 'self.cls_fc_DSC' + str(mark)
-            pred_src = eval(DSC_name)(data_src_DSFE)
-            # pred_src->(64,3), label_src->(64,1), label_src.squeeze()->(64)
-            cls_loss = F.nll_loss(F.log_softmax(pred_src, dim=1), label_src.squeeze())
-            # train_acc = (pred_src.argmax(1) == label_src.squeeze()).sum()/label_src.size(0)
-            pred_src = F.softmax(pred_src, dim=1)
-            pred_src = pred_src.data.max(1)[1]
-            train_acc = pred_src.eq(label_src.data.squeeze()).cpu().sum()/label_src.size(0)
-            return cls_loss, mmd_loss, disc_loss, train_acc
-            
+            # calculate the training loss
+            for i in range(len(data_src_pred)):
+                cls_loss += F.nll_loss(F.log_softmax(data_src_pred[i], dim=1), label_src[i].squeeze())
+                pred_src = F.softmax(data_src_pred[i], dim=1)
+                pred_src = pred_src.data.max(1)[1]
+                train_acc_num += pred_src.eq(label_src[i].data.squeeze()).cpu().sum()
+            return cls_loss, mmd_loss, disc_loss, train_acc_num.item()     
+        
         else:
-            data_CFE = self.sharedNet(data_src)
+            data_CFE = self.sharedNet(data_tgt)
             pred = []
+            disc_loss = 0
             for i in range(number_of_source):
                 DSFE_name = 'self.DSFE' + str(i)
                 DSC_name = 'self.cls_fc_DSC' + str(i)
                 feature_DSFE_i = eval(DSFE_name)(data_CFE)
                 pred.append(eval(DSC_name)(feature_DSFE_i))
-            
+            # discrepency loss
+            for i in range(len(pred)):
+                for j in range(len(pred)):
+                    if i != j:
+                        disc_loss += torch.mean(torch.abs(
+                        F.softmax(pred[i], dim=1) - F.softmax(pred[j], dim=1)
+                    ))
+            print('when testing the disc_loss is: ', disc_loss)
             return pred
 
 class MEERNtmp(nn.Module):

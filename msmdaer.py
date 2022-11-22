@@ -36,7 +36,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 class MSMDAER():
-    def __init__(self, model=models.MSMDAERNet(), source_loaders=0, target_loader=0, batch_size=64, iteration=10000, lr=0.001, momentum=0.9, log_interval=10):
+    def __init__(self, model=models.MSMDAERNet(), source_loaders=0, target_loader=0, batch_size=64, iteration=200, lr=0.001, momentum=0.9, log_interval=10):
         self.model = model
         self.model.to(device)
         self.source_loaders = source_loaders
@@ -56,90 +56,76 @@ class MSMDAER():
             source_iters.append(iter(self.source_loaders[k]))
         target_iter = iter(self.target_loader)
         correct = 0
-
+        # LEARNING_RATE = self.lr / math.pow((1 + 10 * (i - 1) / (self.iteration)), 0.75)
+        LEARNING_RATE = self.lr
+        # if (i - 1) % 100 == 0:
+        #     print("Learning rate: ", LEARNING_RATE)
+        # optimizer = torch.optim.SGD(self.model.parameters(), lr=LEARNING_RATE, momentum=self.momentum)
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
+        # optimizer = torch.optim.AdamW(self.model.parameters(), lr=LEARNING_RATE, weight_decay=0.01)
+        # lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=self.iteration, eta_min=1e-3*0.1, last_epoch=-1)
+        # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80,160,240], gamma=0.1, last_epoch=-1)
         # 构建 SummaryWriter
-        writer = SummaryWriter("./runs/test_cls_0.2gamma_2gamma_unlinear")
-        # mmd = {}
-        # feature_s = []
-        # feature_t = []
-        for i in range(1, self.iteration+1):
+        # writer = SummaryWriter("./runs/test/temp_0.1gamma_1gamma")
+        for i in range(1, self.iteration + 1):
             self.model.train()
-            # LEARNING_RATE = self.lr / math.pow((1 + 10 * (i - 1) / (self.iteration)), 0.75)
-            LEARNING_RATE = self.lr
-            # if (i - 1) % 100 == 0:
-            #     print("Learning rate: ", LEARNING_RATE)
-            # optimizer = torch.optim.SGD(self.model.parameters(), lr=LEARNING_RATE, momentum=self.momentum)
-            optimizer = torch.optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
-            # scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[80,160,240], gamma=0.1, last_epoch=-1)
-            # if i == 401:
-            #     print("After iter len(source_iters)", len(source_iters))
-
+            try:
+                target_data, _ = next(target_iter)
+            except Exception as err:
+                target_iter = iter(self.target_loader)
+                target_data, _ = next(target_iter)
+            target_data = target_data.to(device)
+            train_actul_num = 0
+            source_data = []
+            source_label = []
             for j in range(len(source_iters)):
                 try:
-                    source_data, source_label = next(source_iters[j])
+                    source_data_j, source_label_j = next(source_iters[j])
                 except Exception as err:
                     source_iters[j] = iter(self.source_loaders[j])
-                    source_data, source_label = next(source_iters[j])
-                try:
-                    target_data, _ = next(target_iter)
-                except Exception as err:
-                    target_iter = iter(self.target_loader)
-                    target_data, _ = next(target_iter)
-                #  source_data size:(64, )
-                source_data, source_label = source_data.to(device), source_label.to(device)
-                target_data = target_data.to(device)
+                    source_data_j, source_label_j = next(source_iters[j])
+                source_data_j, source_label_j = source_data_j.to(device), source_label_j.to(device)
+                source_data.append(source_data_j)
+                source_label.append(source_label_j)
+                train_actul_num += source_label_j.size(0)
+            optimizer.zero_grad()
+            cls_loss, mmd_loss, disc_loss, train_acc_num = self.model(data_src=source_data, 
+            number_of_source=len(source_iters), data_tgt=target_data, label_src=source_label)
 
-                optimizer.zero_grad()
-                cls_loss, mmd_loss , l1_loss, train_acc = self.model(data_src=source_data, number_of_source=len(
-                    source_iters), data_tgt=target_data, label_src=source_label, mark=j)
-                writer.add_scalar('Accuracy/training accuracy'+ str(j), 100. * train_acc, i)
-                # if i <= 400:
-                #     if i == 1:
-                #         feature_s.append(source_feature)
-                #         feature_t.append(target_feature)
-                #     else:
-                #         feature_s[j] += source_feature
-                #         feature_t[j] += target_feature
-                gamma = 2 / (1 + math.exp(-10 * (i) / (self.iteration))) - 1
-                beta = gamma/5
-                # loss = cls_loss + gamma * (mmd_loss + l1_loss)
-                loss = cls_loss + beta * mmd_loss + 2 * gamma * l1_loss
-                # loss = cls_loss + 0.1 * mmd_loss + 1 * l1_loss
-                # loss = cls_loss + gamma * (mmd_loss)
+            gamma = 2 / (1 + math.exp(-10 * (i) / (self.iteration))) - 1
+            # LOSS_WEIGHT = 1.0/(1.0+torch.exp(torch.tensor(100.0-epoch)))
+            beta = gamma/10
+            # loss = cls_loss + gamma * (mmd_loss + disc_loss)
+            # loss = cls_loss + mmd_loss + 0.1 * disc_loss
+            loss = cls_loss + gamma * mmd_loss + beta * disc_loss
+            # loss = cls_loss + gamma * (mmd_loss)
+            # writer.add_scalar('Accuracy/training accuracy', 100. * train_acc_num/train_actul_num, i)
+            # writer.add_scalar('Loss/training loss', loss, i)
+            # writer.add_scalar('Loss/training cls loss', cls_loss, i)
+            # writer.add_scalar('Loss/training mmd loss', mmd_loss, i)
+            # writer.add_scalar('Loss/training disc_loss', disc_loss, i)
+            # writer.add_scalar('Loss/training gamma', gamma, i)
                 
-                # writer.add_scalar('Loss/training loss' + str(j), loss, i)
-                # writer.add_scalar('Loss/training loss', loss, i)
-                # writer.add_scalar('Loss/training cls loss'+ str(j), cls_loss, i)
-                # writer.add_scalar('Loss/training cls loss', cls_loss, i)
-                # writer.add_scalar('Loss/training mmd loss' + str(j), mmd_loss, i)
-                # writer.add_scalar('Loss/training mmd loss', mmd_loss, i)
-                # writer.add_scalar('Loss/training l1 loss'+ str(j), l1_loss, i)
-                # writer.add_scalar('Loss/training l1 loss', l1_loss, i)
+            loss.backward()
+            optimizer.step()
+            # lr_scheduler.step(iteration)
 
-                # writer.add_scalar('Loss/training gamma', gamma, i)
-
-                loss.backward()
-                optimizer.step()
-                # if scheduler:
-                #     scheduler.step()
-
-                # if i % log_interval == 0:
-                #     print('Train source' + str(j) + ', iter: {} [({:.0f}%)]\tLoss: {:.6f}\tsoft_loss: {:.6f}\tmmd_loss {:.6f}\tl1_loss: {:.6f}'.format(
-                #         i, 100.*i/self.iteration, loss.item(), cls_loss.item(), mmd_loss.item(), l1_loss.item()
-                #     )
-                #     )
-
-            
+            # if i % log_interval == 0:
+            #     print('Train source' + str(j) + ', iter: {} [({:.0f}%)]\tLoss: {:.6f}\tsoft_loss: {:.6f}\tmmd_loss {:.6f}\tl1_loss: {:.6f}'.format(
+            #         i, 100.*i/self.iteration, loss.item(), cls_loss.item(), mmd_loss.item(), l1_loss.item()
+            #     )
+            #     )
             if i % (log_interval * 20) == 0:
-                t_correct = self.test(i)
-                writer.add_scalar('Accuracy/test accuracy', 100. * t_correct / len(self.target_loader.dataset), i)
+                t_correct = self.test()
+                # writer.add_scalar('Accuracy/test accuracy', 100. * t_correct / len(self.target_loader.dataset), i)
                 if t_correct > correct:
                     correct = t_correct
-                # print('to target max correct: ', correct.item(), "\n")
-        writer.close()
+            
+            # print('to target max correct: ', correct.item(), "\n")
+        # writer.close()
         return 100. * correct / len(self.target_loader.dataset)
 
-    def test(self, i):
+    def test(self):
         self.model.eval()
         test_loss = 0
         correct = 0
@@ -150,7 +136,7 @@ class MSMDAER():
             for data, target in self.target_loader:
                 data = data.to(device)
                 target = target.to(device)
-                preds = self.model(data, len(self.source_loaders))
+                preds = self.model(data_tgt=data, number_of_source=len(self.source_loaders))
                 for i in range(len(preds)):
                     preds[i] = F.softmax(preds[i], dim=1)
                 pred = sum(preds)/len(preds)    
@@ -212,7 +198,7 @@ def cross_subject(data, label, session_id, subject_id, category_number, batch_si
                     source_loaders=source_loaders,
                     target_loader=target_loader,
                     batch_size=batch_size,
-                    iteration=iteration,
+                    iteration = iteration,
                     lr=lr,
                     momentum=momentum,
                     log_interval=log_interval)
@@ -244,12 +230,12 @@ if __name__ == '__main__':
     bn = args.norm_type
     # data preparation
     print('Model name: MS-MDAER. Dataset name: ', dataset_name)
-    data, label = utils.load_data(dataset_name)
-    np.save('SEED_raw_data_filter_nor.npy', data)
-    np.save('SEED_raw_label_filter_nor.npy', label)
+    # data, label = utils.load_data(dataset_name)
+    # np.save('SEED_raw_data_filter_nor.npy', data)
+    # np.save('SEED_raw_label_filter_nor.npy', label)
     # 第一次处理完数据保存在当地，下次可以直接load
-    # data = np.load('SEED_raw_data_filter_nor.npy')
-    # label = np.load('SEED_raw_label_filter_nor.npy')
+    data = np.load('SEED_raw_data_filter_nor.npy')
+    label = np.load('SEED_raw_label_filter_nor.npy')
     print("the shape of data:", data.shape)
     print("the label of label:", label.shape)
     data_tmp = copy.deepcopy(data)
@@ -307,13 +293,13 @@ if __name__ == '__main__':
     csesn = []
     data_tmp = data_tmp.reshape(3,15,3394,1,62,200)
     # cross-validation, LOSO
-    for session_id_main in range(3):
-        for subject_id_main in range(15):
-            csub.append(cross_subject(data_tmp, label_tmp, session_id_main, subject_id_main, category_number,
-                                      batch_size, iteration, lr, momentum, log_interval))
+    # for session_id_main in range(3):
+    #     for subject_id_main in range(15):
+    #         csub.append(cross_subject(data_tmp, label_tmp, session_id_main, subject_id_main, category_number,
+    #                                   batch_size, iteration, lr, momentum, log_interval))
     
-    # csub.append(cross_subject(data_tmp, label_tmp, 0, 0, category_number,
-    #                                    batch_size, iteration, lr, momentum, log_interval))
+    csub.append(cross_subject(data_tmp, label_tmp, 0, 0, category_number,
+                                       batch_size, iteration, lr, momentum, log_interval))
 
     print("Cross-subject: ", csub)
     # print("Cross-session mean: ", np.mean(csesn), "std: ", np.std(csesn))
