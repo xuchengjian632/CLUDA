@@ -1,12 +1,18 @@
-'''
-Description: 
-Author: voicebeer
-Date: 2020-09-08 07:00:34
-LastEditTime: 2021-12-22 01:53:49
-'''
-import torch.nn.functional as F
-from scipy.signal import filtfilt, butter
-# For SEED data loading
+import os.path
+from itertools import compress
+from typing import Dict
+from typing import Optional
+from mne.io import RawArray, concatenate_raws, read_raw_edf
+import mne
+import numpy as np
+# from braindecode.datasets import MOABBDataset
+# from braindecode.preprocessing import (
+#     Preprocessor,
+#     create_windows_from_events,
+#     preprocess,
+#     scale,
+# )
+
 import os
 import scipy.io as scio
 import torch.nn as nn
@@ -15,15 +21,63 @@ import numpy as np
 import random
 random.seed(0)
 import copy
-import pickle
-import pandas as pd
+import scipy
 # DL
 import torch
 from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+from typing import Dict, Optional
+from scipy.signal import filtfilt, butter
+import pytorch_lightning as pl
+from sklearn.preprocessing import StandardScaler
+import torch
+from torch.utils.data.dataloader import DataLoader
+from torch.utils.data.dataset import TensorDataset
 
-dataset_path = {'seed4': '/share/data/emotion/SEED_IV/SEED_IV/eeg_feature_smooth', 'seed3': '/home/cjxu/code/data/SEED/Preprocessed_EEG'}
-#   /home/cjxu/code/data/SEED/ExtractedFeatures
-#   /home/cjxu/code/data/SEED/Preprocessed_EEG
+
+class BaseDataModule(pl.LightningDataModule):
+    dataset = None
+    train_dataset = None
+    test_dataset = None
+
+    def __init__(self, preprocessing_dict: Dict, subject_id: int):
+        super(BaseDataModule, self).__init__()
+        self.preprocessing_dict = preprocessing_dict
+        self.subject_id = subject_id
+
+    def prepare_data(self) -> None:
+        raise NotImplementedError
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        raise NotImplementedError
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(self.train_dataset,
+                          batch_size=self.preprocessing_dict["batch_size"],
+                          shuffle=True)
+
+    def val_dataloader(self) -> DataLoader:
+        return self.test_dataloader()
+
+    def test_dataloader(self) -> DataLoader:
+        return DataLoader(self.test_dataset,
+                          batch_size=self.preprocessing_dict["batch_size"])
+
+    @staticmethod
+    def _z_scale(X, X_test):
+        for ch_idx in range(X.shape[1]):
+            sc = StandardScaler()
+            X[:, ch_idx, :] = sc.fit_transform(X[:, ch_idx, :])
+            X_test[:, ch_idx, :] = sc.transform(X_test[:, ch_idx, :])
+        return X, X_test
+
+    @staticmethod
+    def _make_tensor_dataset(X, y):
+        return TensorDataset(torch.Tensor(X), torch.Tensor(y).type(torch.LongTensor))
+    
+
+dataset_path = {'seed4': '/share/data/emotion/SEED_IV/SEED_IV/eeg_feature_smooth', 'seed3': '/home/cjxu/code/data/SEED/ExtractedFeatures'}
+
 '''
 Tools
 '''
@@ -49,23 +103,13 @@ def normalization(data):
     param {type} 
     return {type} 
     '''
-    # data_mean = np.mean(data)
-    # data_std = np.std(data)
-    # return (data - data_mean)/data_std
-    _range = np.max(data) - np.min(data)
-    return (data - np.min(data)) / _range
+    data_mean = np.mean(data)
+    data_std = np.std(data)
+    return (data - data_mean) / data_std
+    
+    # _range = np.max(data) - np.min(data)
+    # return (data - np.min(data)) / _range
 
-# butter worth bandpass filter
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
-def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    y = filtfilt(b, a, data, axis=1)
-    return y
 
 # package the data and label into one class
 class CustomDataset(Dataset):
@@ -98,7 +142,6 @@ def guassian_kernel(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None
     kernel_val = [torch.exp(-L2_distance / bandwidth_temp) for bandwidth_temp in bandwidth_list]
     return sum(kernel_val)#/len(kernel_val)
 
-
 def mmd(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     batch_size = int(source.size()[0])
     kernels = guassian_kernel(source, target,
@@ -108,6 +151,15 @@ def mmd(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
     XY = kernels[:batch_size, batch_size:]
     YX = kernels[batch_size:, :batch_size]
     loss = torch.mean(XX + YY - XY -YX)
+    return loss
+
+# new mmd method
+min_var_est = 1e-8
+
+def linear_mmd2(f_of_X, f_of_Y):
+    loss = 0.0
+    delta = f_of_X - f_of_Y
+    loss = torch.mean((delta[:-1] * delta[1:]).sum(1))
     return loss
 
 def mmd_rbf_accelerate(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
@@ -124,10 +176,6 @@ def mmd_rbf_accelerate(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=N
 
 
 def mmd_linear(f_of_X, f_of_Y):
-    # print("source data: {}".format(f_of_X))
-    # print("target data: {}".format(f_of_Y))
-    # print("the mean of source data: {}".format(sum(f_of_X)/len(f_of_X)))
-    # print("the mean of target data: {}".format(sum(f_of_Y)/len(f_of_Y)))
     loss = 0.0
     delta = f_of_X.float().mean(0) - f_of_Y.float().mean(0)
     loss = delta.dot(delta)
@@ -135,6 +183,7 @@ def mmd_linear(f_of_X, f_of_Y):
     # delta = f_of_X - f_of_Y
     # loss = torch.mean(torch.mm(delta, torch.transpose(delta, 0, 1)))
     # return loss
+
 
 def CORAL(source, target):
     d = source.data.shape[1]
@@ -182,7 +231,6 @@ def get_number_of_label_n_trial(dataset_name):
     label_seed3 = [[2,1,0,0,1,2,0,1,2,2,1,0,1,2,0],
                     [2,1,0,0,1,2,0,1,2,2,1,0,1,2,0],
                     [2,1,0,0,1,2,0,1,2,2,1,0,1,2,0]]
-    "1,0,-1,-1,0,1,-1,0,1,1,0,-1,0,1,-1"
     if dataset_name == 'seed3':
         label = 3
         trial = 15
@@ -203,17 +251,11 @@ def reshape_data(data, label):
     return {type}:
         reshape_data: array, x*310
         reshape_label: array, x*1
-    '''
+    '''    
     reshape_data = None
     reshape_label = None
     for i in range(len(data)):
-        filter_data = butter_bandpass_filter(data[i], lowcut=4, highcut=47, fs=200, order=8)
-        trial_mean = np.mean(filter_data, axis=1).reshape(62,1)
-        trial_std = np.std(filter_data, axis=1).reshape(62,1)
-        filter_data = (filter_data - trial_mean)/trial_std
-        Length = int(len(filter_data[0])/200)
-        temp_data = filter_data[:, 0:Length*200]
-        one_data = np.transpose(np.reshape(temp_data, (62, -1, 200)),(1,0,2))
+        one_data = np.reshape(np.transpose(data[i], (1,2,0)), (-1,310), order='F')
         one_label = np.full((one_data.shape[0],1), label[i])
         if reshape_data is not None:
             reshape_data = np.vstack((reshape_data, one_data))
@@ -234,12 +276,9 @@ def get_data_label_frommat(mat_path, dataset_name, session_id):
     '''
     _, _, labels = get_number_of_label_n_trial(dataset_name)
     mat_data = scio.loadmat(mat_path)
-    del mat_data["__header__"]
-    del mat_data["__version__"]
-    del mat_data["__globals__"]
-    # mat_de_data = {key:value for key, value in mat_data.items() if key.startswith('de_LDS')}
-    mat_data = list(mat_data.values())
-    one_sub_data, one_sub_label = reshape_data(mat_data, labels[session_id])
+    mat_de_data = {key:value for key, value in mat_data.items() if key.startswith('de_LDS')}
+    mat_de_data = list(mat_de_data.values())
+    one_sub_data, one_sub_label = reshape_data(mat_de_data, labels[session_id])
     return one_sub_data, one_sub_label
 
 def sample_by_value(list, value, number):
@@ -281,6 +320,230 @@ def get_allmats_name(dataset_name):
             allmats.append(mats_list)
     return path, allmats
 
+# load SHU_dataset
+# butter worth bandpass filter
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    return b, a
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=4):
+    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
+    y = filtfilt(b, a, data, axis=1)
+    return y
+
+def load_physionet_data():
+    data = []
+    label = []
+    sub_ids = list(range(1, 110))
+    removed_sub = [38, 88, 89, 92, 100, 104]
+    for i in range(len(removed_sub)):
+        sub_ids.remove(removed_sub[i])
+
+    for sub_num in sub_ids:
+        sub_num = str(sub_num).zfill(3)
+        sub_data = []
+        sub_label = []
+        for run_num in [4, 8, 12]:  # imagine opening and closing left or right fist
+            run_num = str(run_num).zfill(2)
+            data_path = '/home/cjxu/code/data/physionet/files/S' + sub_num + '/S' + sub_num + 'R' + run_num + '.edf'
+            raw = mne.io.read_raw_edf(data_path, preload=False)
+            events_from_annot, event_dict = mne.events_from_annotations(raw)
+            eeg = raw.to_data_frame()
+            eeg = np.array(eeg)
+
+            for sam_num in range(np.shape(events_from_annot)[0]):
+                begin = events_from_annot[sam_num, 0]
+                tmp = eeg[begin:begin+640, :]
+                if events_from_annot[sam_num, 2] != 1:
+                    sub_data.append(tmp)
+                    sub_label.append(events_from_annot[sam_num, 2] - 2)
+
+        for run_num in [6, 10, 14]:
+            run_num = str(run_num).zfill(2)
+            data_path = '/home/cjxu/code/data/physionet/files/S' + sub_num + '/S' + sub_num + 'R' + run_num + '.edf'
+            raw = mne.io.read_raw_edf(data_path, preload=False)
+            events_from_annot, event_dict = mne.events_from_annotations(raw)
+            eeg = raw.to_data_frame()
+            eeg = np.array(eeg)
+            # eeg = eeg[:, [34, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 50, 51, 52, 58]]
+
+            for sam_num in range(np.shape(events_from_annot)[0]):
+                if events_from_annot[sam_num, 2] == 3:
+                    begin = events_from_annot[sam_num, 0]
+                    tmp = eeg[begin:begin + 640, :]
+                    sub_data.append(tmp)
+                    sub_label.append(events_from_annot[sam_num, 2] - 1)
+                elif events_from_annot[sam_num, 2] == 2:
+                    begin = events_from_annot[sam_num, 0]
+                    tmp = eeg[begin:begin + 640, :]
+                    sub_data.append(tmp)
+                    sub_label.append(events_from_annot[sam_num, 2] + 1)
+
+        sub_data = np.array(sub_data)
+        sub_label = np.array(sub_label)
+        sub_data = sub_data[:, :, 1:65]
+        sub_data = np.transpose(sub_data, (0, 2, 1))
+        sub_label = sub_label.reshape(-1, 1)
+        # 标准化
+        train_mean = np.mean(sub_data)
+        train_std = np.std(sub_data)
+        sub_data = (sub_data - train_mean) / train_std
+        sub_data = np.expand_dims(sub_data, axis=1)
+        print('The subjects id is:', sub_num)
+        print('The shape of sub_data is:', sub_data.shape)
+        print('The shape of sub_label is:', sub_label.shape)
+        data.append(sub_data)
+        label.append(sub_label)
+    data = np.array(data)
+    label = np.array(label)
+    print('The shape of data is:', data.shape)
+    print('The shape of label is:', label.shape)
+    return data, label
+
+def load_shu_data():
+    path = '/home/cjxu/code/data/shu_MI_data/mat/'
+    data = [([0] * 25) for i in range(2)]
+    label = [([0] * 25) for i in range(2)]
+    for i in range(25):
+        print('Subject: ', i + 1)
+        reshape_train_data = None
+        reshape_train_label = None
+        for j in range(3):
+            if i + 1 < 10:
+                file_name = path + 'sub-00%d_ses-0%d_task_motorimagery_eeg.mat' % (i + 1, j + 1)
+            else:
+                file_name = path + 'sub-0%d_ses-0%d_task_motorimagery_eeg.mat' % (i + 1, j + 1)
+            raw_data = scipy.io.loadmat(file_name)
+            trial_data = raw_data['data']
+            trial_label = raw_data['labels']
+            # trial_data = np.reshape(np.transpose(trial_data, (1, 0, 2)), (32, -1))
+            # trial_data = butter_bandpass_filter(trial_data, lowcut=3, highcut=35, fs=250, order=8)
+            # trial_data = np.transpose(np.reshape(trial_data, (32, -1, 1000)), (1, 0, 2))
+            trial_label = trial_label.reshape(-1, 1) - 1
+            trial_data = np.expand_dims(trial_data, axis=1)
+            print('the shape of trial_train_data is: ', trial_data.shape)
+            print('the shape of trial_train_label is: ', trial_label.shape)
+            if reshape_train_data is not None:
+                reshape_train_data = np.vstack((reshape_train_data, trial_data))
+                reshape_train_label = np.vstack((reshape_train_label, trial_label))
+            else:
+                reshape_train_data = trial_data
+                reshape_train_label = trial_label
+        train_mean = np.mean(reshape_train_data)
+        train_std = np.std(reshape_train_data)
+        reshape_train_data = (reshape_train_data - train_mean) / train_std
+        data[0][i] = reshape_train_data
+        label[0][i] = reshape_train_label
+        
+        reshape_test_data = None
+        reshape_test_label = None
+        for j in range(3, 5):
+            if i + 1 < 10:
+                file_name = path + 'sub-00%d_ses-0%d_task_motorimagery_eeg.mat' % (i + 1, j + 1)
+            else:
+                file_name = path + 'sub-0%d_ses-0%d_task_motorimagery_eeg.mat' % (i + 1, j + 1)
+            raw_data = scipy.io.loadmat(file_name)
+            trial_data = raw_data['data']
+            trial_label = raw_data['labels']
+            # trial_data = np.reshape(np.transpose(trial_data, (1, 0, 2)), (32, -1))
+            # trial_data = butter_bandpass_filter(trial_data, lowcut=3, highcut=35, fs=250, order=8)
+            # trial_data = np.transpose(np.reshape(trial_data, (32, -1, 1000)), (1, 0, 2))
+            trial_label = trial_label.reshape(-1, 1) - 1
+            trial_data = np.expand_dims(trial_data, axis=1)
+            print('the shape of trial_test_data is: ', trial_data.shape)
+            print('the shape of trial_test_label is: ', trial_label.shape)
+            if reshape_test_data is not None:
+                reshape_test_data = np.vstack((reshape_test_data, trial_data))
+                reshape_test_label = np.vstack((reshape_test_label, trial_label))
+            else:
+                reshape_test_data = trial_data
+                reshape_test_label = trial_label
+        reshape_test_data = (reshape_test_data - train_mean) / train_std
+        data[1][i] = reshape_test_data
+        label[1][i] = reshape_test_label
+    data, label = np.array(data), np.array(label)
+    print('data.shape:', data.shape, 'label.shape:', label.shape)
+    return data, label
+
+def load_data_2b(data_path):
+    data = [([0] * 9) for i in range(2)]
+    label = [([0] * 9) for i in range(2)]
+    # load train data
+    for i in range(1, 10):
+        train_data = None
+        train_label = None
+        for j in range(1, 4):
+            total_data = scipy.io.loadmat(data_path + 'B0%d0%dT.mat' % (i, j))
+            temp_train_data = total_data['data']
+            temp_train_label = total_data['label']
+            temp_train_data = np.transpose(temp_train_data, (2, 1, 0))
+            temp_train_data = np.expand_dims(temp_train_data, axis=1)
+            temp_train_label = temp_train_label - 1
+            temp_train_data = temp_train_data[:120]
+            temp_train_label = temp_train_label[:120]
+            if train_data is not None:
+                train_data = np.vstack((train_data, temp_train_data))
+                train_label = np.vstack((train_label, temp_train_label))
+            else:
+                train_data = temp_train_data
+                train_label = temp_train_label
+        data[0][i-1] = train_data
+        label[0][i-1] = train_label
+    # load test data
+    for i in range(1, 10):
+        test_data = None
+        test_label = None
+        for j in range(4, 6):
+            total_data = scipy.io.loadmat(data_path + 'B0%d0%dE.mat' % (i, j))
+            temp_test_data = total_data['data']
+            temp_test_label = total_data['label']
+            temp_test_data = np.transpose(temp_test_data, (2, 1, 0))
+            temp_test_data = np.expand_dims(temp_test_data, axis=1)
+            temp_test_label = temp_test_label - 1
+            temp_test_data = temp_test_data[:120]
+            temp_test_label = temp_test_label[:120]
+            if test_data is not None:
+                test_data = np.vstack((test_data, temp_test_data))
+                test_label = np.vstack((test_label, temp_test_label))
+            else:
+                test_data = temp_test_data
+                test_label = temp_test_label
+        data[1][i-1] = test_data
+        label[1][i-1] = test_label
+
+    return np.array(data), np.array(label)
+
+def load_data_2a(data_path):
+    data = [([0] * 9) for i in range(2)]
+    label = [([0] * 9) for i in range(2)]
+    # load train data
+    for i in range(1, 10):
+        total_data = scipy.io.loadmat(data_path + 'A0%dT.mat' % i)
+        temp_train_data = total_data['data']
+        temp_train_label = total_data['label']
+        temp_train_data = np.transpose(temp_train_data, (2, 1, 0))
+        temp_train_data = np.expand_dims(temp_train_data, axis=1)
+        temp_train_label = temp_train_label - 1
+        data[0][i-1] = temp_train_data
+        label[0][i-1] = temp_train_label
+    
+    # load test data
+    for j in range(1, 10):
+        total_data = scipy.io.loadmat(data_path + 'A0%dE.mat' % j)
+        temp_test_data = total_data['data']
+        temp_test_label = total_data['label']
+        temp_test_data = np.transpose(temp_test_data, (2, 1, 0))
+        temp_test_data = np.expand_dims(temp_test_data, axis=1)
+        temp_test_label = temp_test_label - 1
+        data[1][j-1] = temp_test_data
+        label[1][j-1] = temp_test_label
+    
+    return np.array(data), np.array(label)
+
+
 def load_data(dataset_name):
     '''
     description: get all the data from one dataset
@@ -296,48 +559,97 @@ def load_data(dataset_name):
         for j in range(len(allmats[0])):
             mat_path = path + '/' + str(i+1) + '/' + allmats[i][j]
             one_data, one_label = get_data_label_frommat(mat_path, dataset_name, i)
-            data[i][j] = one_data.copy()
-            label[i][j] = one_label.copy()
-            print("sessions:", i)
-            print("subject:", j)
-            print(" ")
+            data[i][j] = np.array(one_data.copy())
+            label[i][j] = np.array(one_label.copy())
     return np.array(data), np.array(label)
 
+# load HGD
+# def load_hgd(subject_id: int, preprocessing_dict: Dict = None,
+#              verbose: str = "WARNING"):
+#     dataset = MOABBDataset(dataset_name="Schirrmeister2017", subject_ids=[subject_id])
 
-# def load_deap():
-#     '''
-#     description: 
-#     param {type} 
-#     return {type} 
-#     '''
-#     path = 'deap'
-#     dats = os.listdir(path)
-#     dats.sort()
+#     if preprocessing_dict.get("remove_artifacts", True):
+#         # find samples < 800 uV and save masks for later
+#         window_dataset = create_windows_from_events(dataset, preload=False)
+#         ds_masks = []
+#         for ds in window_dataset.datasets:
+#             clean_trial_mask = np.max(
+#                 np.abs(ds.windows.load_data()._data), axis=(-2, -1)) < 800 * 1e-6
+#             ds_masks.append(clean_trial_mask)
 
-#     for i in range(1, len(dats)):
-#         temp_dat_file = pickle.load(open((path+"/"+dats[i]), 'rb'), encoding='iso-8859-1')
-#         temp_data, temp_label = temp_dat_file['data'], temp_dat_file['labels']
-#         np.vstack((data, temp_data))
-        # np.vstack((label, temp_label))
-    # print(data.shape, label.shape)
-    # for i in range()
-    # x = pickle.load(open('deap/s01.dat', 'rb'), encoding='iso-8859-1')
+#     channels = [
+#         "FC5", "FC1", "FC2", "FC6", "C3", "C4", "CP5", "CP1", "CP2", "CP6", "FC3",
+#         "FCz", "FC4", "C5", "C1", "C2", "C6", "CP3", "CPz", "CP4", "FFC5h", "FFC3h",
+#         "FFC4h", "FFC6h", "FCC5h", "FCC3h", "FCC4h", "FCC6h", "CCP5h", "CCP3h", "CCP4h",
+#         "CCP6h", "CPP5h", "CPP3h", "CPP4h", "CPP6h", "FFC1h", "FFC2h", "FCC1h", "FCC2h",
+#         "CCP1h", "CCP2h", "CPP1h", "CPP2h",
+#     ]
+
+#     preprocessors = [
+#         Preprocessor("pick_channels", ch_names=channels, verbose=verbose),
+#         Preprocessor(scale, factor=1e6, apply_on_array=True),  # from uV to V
+#         Preprocessor("resample", sfreq=preprocessing_dict["sfreq"], verbose=verbose)
+#     ]
+
+#     l_freq, h_freq = preprocessing_dict["low_cut"], preprocessing_dict["high_cut"]
+#     if l_freq is not None or h_freq is not None:
+#         preprocessors.append(Preprocessor("filter", l_freq=l_freq, h_freq=h_freq,
+#                                           verbose=verbose))
+
+#     preprocess(dataset, preprocessors)
+
+#     # create windows
+#     sfreq = dataset.datasets[0].raw.info["sfreq"]
+#     trial_start_offset_samples = int(preprocessing_dict["start"] * sfreq)
+#     trial_stop_offset_samples = int(preprocessing_dict["stop"] * sfreq)
+#     windows_dataset = create_windows_from_events(
+#         dataset, trial_start_offset_samples=trial_start_offset_samples,
+#         trial_stop_offset_samples=trial_stop_offset_samples, preload=False
+#     )
+
+#     if preprocessing_dict.get("remove_artifacts", True):
+#         for (mask, ds) in zip(ds_masks, windows_dataset.datasets):
+#             ds.windows = ds.windows[mask]
+#             ds.y = list(compress(ds.y, mask))
+
+#     return windows_dataset
+
+# def load_HGD():
+#     preprocessing_dict = {'sfreq': 250, 'low_cut': 4, 'high_cut': None, 'start': 0.0, 'stop': 0.0,
+#                           'remove_artifacts': True,
+#                           'z_scale': True,
+#                           'batch_size': 64}
+#     data = [([0] * 14) for i in range(2)]
+#     label = [([0] * 14) for i in range(2)]
+#     for i in range(1, 15):
+#         dataset = load_hgd(i, preprocessing_dict)
     
-    # return x
-
-# print(load_deap()['data'].shape)
-# load_deap()
-
-# def initial_cd_ud(data, label, cd_count=16, dataset_name):
-#     cd_list, ud_list = [], []
-#     number_trial, number_label, _ = get_number_of_label_n_trial(dataset_name)
-#     for i in range(number_label):
-#         cd_list.extend(sample_by_value(label, i, int(cd_count/number_label)))
-#     ud_list.extend([i for i in range(number_trial) if i not in cd_list])
-#     cd_label_list = copy.deepcopy(cd_list)
-#     ud_label_list = copy.deepcopy(ud_list)
-#     for i in range(len(cd_list)):
-#         cd_list[i] = 
+#         # split the data
+#         splitted_ds = dataset.split("run")
+#         train_dataset, test_dataset = splitted_ds["0train"], splitted_ds["1test"]
+#         # load the data
+#         X = train_dataset.datasets[0].windows.load_data()._data
+#         y = np.array(train_dataset.datasets[0].y)
+#         X_test = test_dataset.datasets[0].windows.load_data()._data
+#         y_test = np.array(test_dataset.datasets[0].y)
+#         # scale data
+#         if preprocessing_dict["z_scale"]:
+#             X, X_test = BaseDataModule._z_scale(X, X_test)
+            
+#         X = np.expand_dims(X, axis=1)
+#         X_test = np.expand_dims(X_test, axis=1)
+#         y = y.reshape(-1, 1)
+#         y_test = y_test.reshape(-1, 1)
+#         data[0][i-1] = X
+#         data[1][i-1] = X_test
+#         label[0][i-1] = y
+#         label[1][i-1] = y_test
+#         print('the shape of X:', X.shape)
+#         print('the shape of y:', y.shape)
+#         print('the shape of X_test:', X_test.shape)
+#         print('the shape of y_test:', y_test.shape)
+#     data, label = np.array(data), np.array(label)
+#     return data, label
 
 def pick_one_data(dataset_name, session_id=1, cd_count=4, sub_id=0):
     '''
@@ -380,6 +692,7 @@ def pick_one_data(dataset_name, session_id=1, cd_count=4, sub_id=0):
     
     return cd_data, cd_label, ud_data, ud_label
 
+
 def exponential_running_standardize(
         data, factor_new=0.001, init_block_size=None, eps=1e-4
 ):
@@ -392,6 +705,7 @@ def exponential_running_standardize(
         Standardize data before to this index with regular standardization.
     eps: float
         Stabilizer for division by zero variance.
+
     Returns
     -------
     standardized: 2darray (time, channels)
@@ -425,175 +739,3 @@ def EMS(X, factor_new=1e-3, init_block_size=1000):
         X[i, :, :] = exponential_running_standardize(trial.T, factor_new=factor_new,
                                                      init_block_size=init_block_size, eps=1e-4).T
     return X
-
-
-class Expression(torch.nn.Module):
-    """
-    Compute given expression on forward pass.
-    Parameters
-    ----------
-    expression_fn: function
-        Should accept variable number of objects of type
-        `torch.autograd.Variable` to compute its output.
-    """
-
-    def __init__(self, expression_fn):
-        super(Expression, self).__init__()
-        self.expression_fn = expression_fn
-
-    def forward(self, *x):
-        return self.expression_fn(*x)
-
-    def __repr__(self):
-        if hasattr(self.expression_fn, "func") and hasattr(
-            self.expression_fn, "kwargs"
-        ):
-            expression_str = "{:s} {:s}".format(
-                self.expression_fn.func.__name__, str(self.expression_fn.kwargs)
-            )
-        elif hasattr(self.expression_fn, "__name__"):
-            expression_str = self.expression_fn.__name__
-        else:
-            expression_str = repr(self.expression_fn)
-        return (
-            self.__class__.__name__
-            + "("
-            + "expression="
-            + str(expression_str)
-            + ")"
-        )
-
-def np_to_var(
-    X, requires_grad=False, dtype=None, pin_memory=False, **tensor_kwargs
-):
-    """
-    Convenience function to transform numpy array to `torch.Tensor`.
-    Converts `X` to ndarray using asarray if necessary.
-    Parameters
-    ----------
-    X: ndarray or list or number
-        Input arrays
-    requires_grad: bool
-        passed on to Variable constructor
-    dtype: numpy dtype, optional
-    var_kwargs:
-        passed on to Variable constructor
-    Returns
-    -------
-    var: `torch.Tensor`
-    """
-    if not hasattr(X, "__len__"):
-        X = [X]
-    X = np.asarray(X)
-    if dtype is not None:
-        X = X.astype(dtype)
-    X_tensor = torch.tensor(X, requires_grad=requires_grad, **tensor_kwargs)
-    if pin_memory:
-        X_tensor = X_tensor.pin_memory()
-    return X_tensor
-
-
-class AvgPool2dWithConv(torch.nn.Module):
-    """
-    Compute average pooling using a convolution, to have the dilation parameter.
-    Parameters
-    ----------
-    kernel_size: (int,int)
-        Size of the pooling region.
-    stride: (int,int)
-        Stride of the pooling operation.
-    dilation: int or (int,int)
-        Dilation applied to the pooling filter.
-    padding: int or (int,int)
-        Padding applied before the pooling operation.
-    """
-
-    def __init__(self, kernel_size, stride, dilation=1, padding=0):
-        super(AvgPool2dWithConv, self).__init__()
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.dilation = dilation
-        self.padding = padding
-        # don't name them "weights" to
-        # make sure these are not accidentally used by some procedure
-        # that initializes parameters or something
-        self._pool_weights = None
-
-    def forward(self, x):
-        # Create weights for the convolution on demand:
-        # size or type of x changed...
-        in_channels = x.size()[1]
-        weight_shape = (
-            in_channels,
-            1,
-            self.kernel_size[0],
-            self.kernel_size[1],
-        )
-        if self._pool_weights is None or (
-            (tuple(self._pool_weights.size()) != tuple(weight_shape))
-            or (self._pool_weights.is_cuda != x.is_cuda)
-            or (self._pool_weights.data.type() != x.data.type())
-        ):
-            n_pool = np.prod(self.kernel_size)
-            weights = np_to_var(
-                np.ones(weight_shape, dtype=np.float32) / float(n_pool)
-            )
-            weights = weights.type_as(x)
-            if x.is_cuda:
-                weights = weights.cuda()
-            self._pool_weights = weights
-
-        pooled = F.conv2d(
-            x,
-            self._pool_weights,
-            bias=None,
-            stride=self.stride,
-            dilation=self.dilation,
-            padding=self.padding,
-            groups=in_channels,
-        )
-        return pooled
-
-class EarlyStopping:
-    """Early stops the training if validation loss doesn't improve after a given patience."""
-    def __init__(self, patience=7, verbose=False, delta=0):
-        """
-        Args:
-            patience (int): How long to wait after last time validation loss improved.
-                            Default: 7
-            verbose (bool): If True, prints a message for each validation loss improvement. 
-                            Default: False
-            delta (float): Minimum change in the monitored quantity to qualify as an improvement.
-                            Default: 0
-        """
-        self.patience = patience
-        self.verbose = verbose
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        self.val_loss_min = np.Inf
-        self.delta = delta
-
-    def __call__(self, val_loss, model):
-
-        score = -val_loss
-
-        if self.best_score is None:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model)
-        elif score < self.best_score + self.delta:
-            self.counter += 1
-            print(f'EarlyStopping counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            self.best_score = score
-            self.save_checkpoint(val_loss, model)
-            self.counter = 0
-
-    def save_checkpoint(self, val_loss, model):
-        '''Saves model when validation loss decrease.'''
-        if self.verbose:
-            print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}).  Saving model ...')
-        torch.save(model.state_dict(), 'checkpoint.pt')	# 这里会存储迄今最优模型的参数
-        self.val_loss_min = val_loss
